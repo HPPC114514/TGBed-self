@@ -340,7 +340,13 @@
 
     function redirectToTarget() {
       const params = new URLSearchParams(window.location.search);
-      const redirect = params.get('redirect') || '/';
+      let redirect = params.get('redirect') || '/';
+      
+      // 防止重定向到登录页本身，避免无限循环
+      if (redirect.includes('login.html') || redirect === '/login') {
+        redirect = '/';
+      }
+      
       // 使用 replace 防止用户回退到登录页
       window.location.replace(redirect);
     }
