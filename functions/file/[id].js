@@ -59,6 +59,11 @@ function getMimeType(fileName) {
     return MIME_TYPES[ext] || 'application/octet-stream';
 }
 
+// 判断是否是流媒体类型（需要 Range 支持）
+function isStreamableType(mimeType) {
+    return mimeType.startsWith('video/') || mimeType.startsWith('audio/');
+}
+
 // 添加 CORS 和通用响应头
 function addCorsHeaders(headers) {
     headers.set('Access-Control-Allow-Origin', '*');
@@ -74,6 +79,32 @@ function handleOptions() {
     addCorsHeaders(headers);
     headers.set('Access-Control-Max-Age', '86400');
     return new Response(null, { status: 204, headers });
+}
+
+// 解析 Range 请求头
+function parseRangeHeader(rangeHeader, totalSize) {
+    if (!rangeHeader) return null;
+    
+    const match = rangeHeader.match(/bytes=(\d*)-(\d*)/);
+    if (!match) return null;
+    
+    let start = match[1] ? parseInt(match[1], 10) : 0;
+    let end = match[2] ? parseInt(match[2], 10) : totalSize - 1;
+    
+    // 处理后缀范围请求 (bytes=-500 表示最后 500 字节)
+    if (!match[1] && match[2]) {
+        start = Math.max(0, totalSize - parseInt(match[2], 10));
+        end = totalSize - 1;
+    }
+    
+    // 确保范围有效
+    if (start >= totalSize || start < 0 || end < start) {
+        return { invalid: true, totalSize };
+    }
+    
+    end = Math.min(end, totalSize - 1);
+    
+    return { start, end, totalSize };
 }
 
 export async function onRequest(context) {
@@ -121,7 +152,10 @@ export async function onRequest(context) {
     
     // 从 Telegram 获取文件（原有逻辑）
     let fileUrl = 'https://telegra.ph/' + url.pathname + url.search
+    let isTelegramBotFile = false;
+    
     if (url.pathname.length > 39) { // Path length > 39 indicates file uploaded via Telegram Bot API
+        isTelegramBotFile = true;
         const formdata = new FormData();
         formdata.append("file_id", url.pathname);
 
@@ -135,18 +169,32 @@ export async function onRequest(context) {
         console.log(url.pathname.split(".")[0].split("/")[2])
         const filePath = await getFilePath(env, url.pathname.split(".")[0].split("/")[2]);
         console.log(filePath)
+        if (!filePath) {
+            const headers = new Headers();
+            addCorsHeaders(headers);
+            return new Response('Failed to get file path from Telegram', { status: 500, headers });
+        }
         fileUrl = `https://api.telegram.org/file/bot${env.TG_Bot_Token}/${filePath}`;
+    }
+
+    // 获取文件名和 MIME 类型
+    const fileName = record?.metadata?.fileName || params.id;
+    const mimeType = getMimeType(fileName);
+    const rangeHeader = request.headers.get('Range');
+    
+    // 对于流媒体文件，使用增强的 Range 处理
+    if (isStreamableType(mimeType) && rangeHeader) {
+        return await handleStreamableFile(fileUrl, fileName, mimeType, rangeHeader, request);
     }
 
     // 构建请求头，透传 Range 请求
     const fetchHeaders = new Headers();
-    const rangeHeader = request.headers.get('Range');
     if (rangeHeader) {
         fetchHeaders.set('Range', rangeHeader);
         console.log('Range request:', rangeHeader);
     }
 
-    // 发起流式请求到 Telegram
+    // 发起请求到 Telegram
     const response = await fetch(fileUrl, {
         method: request.method === 'HEAD' ? 'HEAD' : 'GET',
         headers: fetchHeaders,
@@ -165,10 +213,6 @@ export async function onRequest(context) {
 
     // Log response details
     console.log('Response status:', response.status, 'Range requested:', !!rangeHeader);
-
-    // 获取文件名，用于确定 MIME 类型
-    const fileName = record?.metadata?.fileName || params.id;
-    const mimeType = getMimeType(fileName);
 
     // Allow the admin page to directly view the image
     const isAdmin = request.headers.get('Referer')?.includes(`${url.origin}/admin`);
@@ -304,6 +348,126 @@ function createStreamResponse(upstreamResponse, fileName, mimeType, rangeHeader)
         statusText: upstreamResponse.statusText,
         headers
     });
+}
+
+// 处理流媒体文件（视频/音频），支持 Range 请求
+async function handleStreamableFile(fileUrl, fileName, mimeType, rangeHeader, originalRequest) {
+    console.log('Handling streamable file with Range:', rangeHeader);
+    
+    // 首先尝试透传 Range 请求
+    const fetchHeaders = new Headers();
+    fetchHeaders.set('Range', rangeHeader);
+    
+    let response = await fetch(fileUrl, {
+        method: 'GET',
+        headers: fetchHeaders,
+    });
+    
+    // 检查上游是否支持 Range 请求
+    if (response.status === 206) {
+        // 上游支持 Range，直接透传
+        console.log('Upstream supports Range, status 206');
+        const headers = new Headers();
+        addCorsHeaders(headers);
+        headers.set('Content-Type', mimeType);
+        headers.set('Accept-Ranges', 'bytes');
+        headers.set('Content-Disposition', `inline; filename="${encodeURIComponent(fileName)}"`);
+        headers.set('Cache-Control', 'public, max-age=31536000');
+        
+        // 透传关键头
+        const contentLength = response.headers.get('Content-Length');
+        const contentRange = response.headers.get('Content-Range');
+        
+        if (contentLength) headers.set('Content-Length', contentLength);
+        if (contentRange) headers.set('Content-Range', contentRange);
+        
+        return new Response(response.body, {
+            status: 206,
+            statusText: 'Partial Content',
+            headers
+        });
+    }
+    
+    // 上游不支持 Range (返回 200)，需要自行实现分片
+    // 这种情况下，我们需要先获取文件总大小
+    console.log('Upstream does not support Range, implementing manually');
+    
+    const totalSize = parseInt(response.headers.get('Content-Length') || '0', 10);
+    
+    if (!totalSize) {
+        // 无法获取文件大小，返回完整文件
+        console.log('Cannot determine file size, returning full file');
+        const headers = new Headers();
+        addCorsHeaders(headers);
+        headers.set('Content-Type', mimeType);
+        headers.set('Accept-Ranges', 'bytes');
+        headers.set('Content-Disposition', `inline; filename="${encodeURIComponent(fileName)}"`);
+        headers.set('Cache-Control', 'public, max-age=31536000');
+        
+        return new Response(response.body, {
+            status: 200,
+            headers
+        });
+    }
+    
+    // 解析 Range 请求
+    const range = parseRangeHeader(rangeHeader, totalSize);
+    
+    if (!range) {
+        // Range 头无效，返回完整文件
+        const headers = new Headers();
+        addCorsHeaders(headers);
+        headers.set('Content-Type', mimeType);
+        headers.set('Content-Length', totalSize.toString());
+        headers.set('Accept-Ranges', 'bytes');
+        headers.set('Content-Disposition', `inline; filename="${encodeURIComponent(fileName)}"`);
+        headers.set('Cache-Control', 'public, max-age=31536000');
+        
+        return new Response(response.body, {
+            status: 200,
+            headers
+        });
+    }
+    
+    if (range.invalid) {
+        // Range 不满足
+        const headers = new Headers();
+        addCorsHeaders(headers);
+        headers.set('Content-Range', `bytes */${range.totalSize}`);
+        return new Response('Range Not Satisfiable', { status: 416, headers });
+    }
+    
+    const { start, end } = range;
+    const chunkSize = end - start + 1;
+    
+    console.log(`Manually slicing: bytes ${start}-${end}/${totalSize}`);
+    
+    // 读取完整文件并切片（这不是最优方案，但在上游不支持 Range 时是唯一选择）
+    // 注意：这会消耗内存，大文件可能会有问题
+    try {
+        const arrayBuffer = await response.arrayBuffer();
+        const slicedBuffer = arrayBuffer.slice(start, end + 1);
+        
+        const headers = new Headers();
+        addCorsHeaders(headers);
+        headers.set('Content-Type', mimeType);
+        headers.set('Content-Length', chunkSize.toString());
+        headers.set('Content-Range', `bytes ${start}-${end}/${totalSize}`);
+        headers.set('Accept-Ranges', 'bytes');
+        headers.set('Content-Disposition', `inline; filename="${encodeURIComponent(fileName)}"`);
+        headers.set('Cache-Control', 'public, max-age=31536000');
+        
+        return new Response(slicedBuffer, {
+            status: 206,
+            statusText: 'Partial Content',
+            headers
+        });
+    } catch (error) {
+        console.error('Error slicing file:', error);
+        const headers = new Headers();
+        addCorsHeaders(headers);
+        return new Response('Error processing file: ' + error.message, { status: 500, headers });
+    }
 }
 
 async function getFilePath(env, file_id) {

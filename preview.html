@@ -1105,16 +1105,9 @@
               airplay: true,
               theme: '#8a4bff',
               lang: navigator.language.toLowerCase().includes('zh') ? 'zh-cn' : 'en',
-              // 关键：允许跨域请求和 Range 请求
+              // 预加载 metadata 以支持进度条拖拽
               moreVideoAttr: {
-                crossOrigin: 'anonymous',
                 preload: 'metadata'
-              },
-              // 自定义请求处理，确保使用正确的 headers
-              customType: {
-                [mimeType]: function (video, url) {
-                  video.src = url;
-                }
               }
             });
 
