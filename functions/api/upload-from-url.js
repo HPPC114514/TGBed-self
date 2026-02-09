@@ -5,12 +5,12 @@
  * POST /api/upload-from-url
  * Body: { url: string, storageMode?: string }
  */
-import { errorHandling, telemetryData } from "../../utils/middleware";
-import { checkAuthentication, isAuthRequired } from "../../utils/auth.js";
-import { checkGuestUpload, incrementGuestCount } from "../../utils/guest.js";
-import { createS3Client } from "../../utils/s3client.js";
-import { uploadToDiscord } from "../../utils/discord.js";
-import { uploadToHuggingFace } from "../../utils/huggingface.js";
+import { errorHandling, telemetryData } from "../utils/middleware";
+import { checkAuthentication, isAuthRequired } from "../utils/auth.js";
+import { checkGuestUpload, incrementGuestCount } from "../utils/guest.js";
+import { createS3Client } from "../utils/s3client.js";
+import { uploadToDiscord } from "../utils/discord.js";
+import { uploadToHuggingFace } from "../utils/huggingface.js";
 
 // 允许的最大文件大小（20MB，与Telegram限制一致）
 const MAX_FILE_SIZE = 20 * 1024 * 1024;
