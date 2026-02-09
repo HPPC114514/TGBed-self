@@ -1,3 +1,7 @@
+import { createS3Client } from '../../../utils/s3client.js';
+import { deleteDiscordMessage } from '../../../utils/discord.js';
+import { deleteHuggingFaceFile } from '../../../utils/huggingface.js';
+
 export async function onRequest(context) {
   const { request, env, params } = context;
   let fileId = params.id;
@@ -18,48 +22,97 @@ export async function onRequest(context) {
     const { record, kvKey } = await getRecordWithKey(env, fileId);
     if (!record || !record.metadata) {
       return jsonResponse(
-        {
-          success: false,
-          error: 'File metadata not found.'
-        },
+        { success: false, error: 'File metadata not found.' },
         404
       );
     }
 
     const metadata = record.metadata;
-    const isR2 = fileId.startsWith('r2:') || metadata.storageType === 'r2' || metadata.storage === 'r2';
+    const storageType = metadata.storageType || metadata.storage || 'telegram';
 
+    // --- R2 删除 ---
+    const isR2 = fileId.startsWith('r2:') || storageType === 'r2';
     if (isR2) {
       const r2Key = metadata.r2Key
         || (kvKey?.startsWith('r2:') ? kvKey.slice(3) : null)
         || (fileId.startsWith('r2:') ? fileId.slice(3) : fileId);
 
-      if (!env.R2_BUCKET) {
-        throw new Error('R2 bucket is not configured.');
-      }
-      if (!r2Key) {
-        throw new Error('Failed to resolve R2 key.');
-      }
+      if (!env.R2_BUCKET) throw new Error('R2 bucket is not configured.');
+      if (!r2Key) throw new Error('Failed to resolve R2 key.');
 
       await env.R2_BUCKET.delete(r2Key);
       await env.img_url.delete(kvKey);
-      console.log('Deleted R2 object and KV metadata:', { r2Key, kvKey });
-
-      // 清除 Cloudflare CDN 边缘缓存，防止删除后图片仍可访问
       await purgeEdgeCache(request, fileId);
 
       return jsonResponse({
         success: true,
         message: 'Deleted from R2 and KV.',
-        fileId,
-        r2Key,
-        kvKey
+        fileId, r2Key, kvKey
       });
     }
 
-    // Telegram path:
-    // 1) try to delete Telegram message (best effort)
-    // 2) always delete KV metadata in finally
+    // --- S3 删除 ---
+    if (storageType === 's3' || fileId.startsWith('s3:')) {
+      const s3Key = metadata.s3Key || fileId.replace(/^s3:/, '');
+      try {
+        const s3 = createS3Client(env);
+        await s3.deleteObject(s3Key);
+      } catch (e) {
+        console.error('S3 delete error (best-effort):', e);
+      }
+      await env.img_url.delete(kvKey);
+      await purgeEdgeCache(request, fileId);
+
+      return jsonResponse({
+        success: true,
+        message: 'Deleted from S3 and KV.',
+        fileId, kvKey
+      });
+    }
+
+    // --- Discord 删除 ---
+    if (storageType === 'discord' || fileId.startsWith('discord:')) {
+      let discordDeleted = false;
+      try {
+        if (metadata.discordChannelId && metadata.discordMessageId) {
+          discordDeleted = await deleteDiscordMessage(
+            metadata.discordChannelId, metadata.discordMessageId, env
+          );
+        }
+      } catch (e) {
+        console.error('Discord delete error (best-effort):', e);
+      }
+      await env.img_url.delete(kvKey);
+      await purgeEdgeCache(request, fileId);
+
+      return jsonResponse({
+        success: true,
+        message: discordDeleted ? 'Deleted from Discord and KV.' : 'KV deleted (Discord best-effort).',
+        fileId, kvKey
+      });
+    }
+
+    // --- HuggingFace 删除 ---
+    if (storageType === 'huggingface' || fileId.startsWith('hf:')) {
+      let hfDeleted = false;
+      try {
+        if (metadata.hfPath) {
+          hfDeleted = await deleteHuggingFaceFile(metadata.hfPath, env);
+        }
+      } catch (e) {
+        console.error('HuggingFace delete error (best-effort):', e);
+      }
+      await env.img_url.delete(kvKey);
+      await purgeEdgeCache(request, fileId);
+
+      return jsonResponse({
+        success: true,
+        message: hfDeleted ? 'Deleted from HuggingFace and KV.' : 'KV deleted (HuggingFace best-effort).',
+        fileId, kvKey
+      });
+    }
+
+    // --- Telegram 删除（默认） ---
     let telegramDeleted = false;
     let telegramDeleteAttempted = false;
     let telegramDeleteError = null;
@@ -67,24 +120,13 @@ export async function onRequest(context) {
     try {
       if (metadata.telegramMessageId) {
         telegramDeleteAttempted = true;
-        console.log('Attempting to delete Telegram message:', metadata.telegramMessageId);
         telegramDeleted = await deleteTelegramMessage(metadata.telegramMessageId, env);
-
-        if (!telegramDeleted) {
-          console.error('Telegram message deletion failed:', metadata.telegramMessageId);
-        }
-      } else {
-        console.warn('No telegramMessageId found in metadata:', kvKey);
       }
     } catch (error) {
       telegramDeleteError = error;
       console.error('Telegram deleteMessage threw:', error);
-      // Do not throw. KV deletion must still run.
     } finally {
       await env.img_url.delete(kvKey);
-      console.log('KV metadata deleted:', kvKey);
-
-      // 清除 Cloudflare CDN 边缘缓存，防止删除后图片仍可访问
       await purgeEdgeCache(request, fileId);
     }
 
@@ -93,29 +135,20 @@ export async function onRequest(context) {
       message: telegramDeleted
         ? 'Deleted from Telegram and KV.'
         : 'KV metadata deleted (Telegram deletion best-effort).',
-      fileId,
-      kvKey,
+      fileId, kvKey,
       telegramDeleteAttempted,
       telegramDeleted,
-      warning: telegramDeleted
-        ? ''
-        : 'Telegram deletion failed or messageId missing, but KV metadata was forcibly deleted.',
+      warning: telegramDeleted ? '' : 'Telegram deletion failed or messageId missing.',
       telegramDeleteError: telegramDeleteError ? telegramDeleteError.message : null
     });
   } catch (error) {
     console.error('Delete error:', error);
-    return jsonResponse(
-      {
-        success: false,
-        error: error.message
-      },
-      500
-    );
+    return jsonResponse({ success: false, error: error.message }, 500);
   }
 }
 
 async function getRecordWithKey(env, fileId) {
-  const prefixes = ['img:', 'vid:', 'aud:', 'doc:', 'r2:', ''];
+  const prefixes = ['img:', 'vid:', 'aud:', 'doc:', 'r2:', 's3:', 'discord:', 'hf:', ''];
   const hasKnownPrefix = prefixes.some((prefix) => prefix && fileId.startsWith(prefix));
   const candidateKeys = hasKnownPrefix ? [fileId] : prefixes.map((prefix) => `${prefix}${fileId}`);
 
@@ -158,12 +191,10 @@ async function deleteTelegramMessage(messageId, env) {
   }
 }
 
-// 清除 Cloudflare CDN 边缘缓存中对应文件的条目
 async function purgeEdgeCache(request, fileId) {
   try {
     const cache = caches.default;
     const origin = new URL(request.url).origin;
-    // 清除所有可能的缓存 URL 变体
     const urlsToPurge = [
       `${origin}/file/${fileId}`,
       `${origin}/file/${encodeURIComponent(fileId)}`,
@@ -171,7 +202,6 @@ async function purgeEdgeCache(request, fileId) {
     for (const url of urlsToPurge) {
       await cache.delete(new Request(url));
     }
-    console.log('Edge cache purged for:', fileId);
   } catch (e) {
     console.warn('Edge cache purge failed (non-critical):', e.message);
   }

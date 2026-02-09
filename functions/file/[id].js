@@ -1,3 +1,7 @@
+import { createS3Client } from '../utils/s3client.js';
+import { getDiscordFileUrl } from '../utils/discord.js';
+import { getHuggingFaceFile } from '../utils/huggingface.js';
+
 // MIME 类型映射表
 const MIME_TYPES = {
     // 视频
@@ -123,24 +127,45 @@ export async function onRequest(context) {
 
     const url = new URL(request.url);
     let fileId = params.id;
-    
+
     // 检查是否是 R2 存储的文件（以 r2: 开头）
     if (fileId.startsWith('r2:')) {
         return await handleR2File(context, fileId.substring(3)); // 移除 r2: 前缀
     }
-    
+
+    // 检查是否是 S3 存储的文件
+    if (fileId.startsWith('s3:')) {
+        return await handleS3File(context, fileId);
+    }
+
+    // 检查是否是 Discord 存储的文件
+    if (fileId.startsWith('discord:')) {
+        return await handleDiscordFile(context, fileId);
+    }
+
+    // 检查是否是 HuggingFace 存储的文件
+    if (fileId.startsWith('hf:')) {
+        return await handleHFFile(context, fileId);
+    }
+
     // 先检查 KV 中是否有该文件的元数据，判断存储类型
     let record = null;
     let isR2Storage = false;
-    
+    let isS3Storage = false;
+    let isDiscordStorage = false;
+    let isHFStorage = false;
+
     if (env.img_url) {
         // 尝试多种前缀查找（兼容新旧 Key 格式）
-        const prefixes = ['img:', 'vid:', 'aud:', 'doc:', 'r2:', ''];
+        const prefixes = ['img:', 'vid:', 'aud:', 'doc:', 'r2:', 's3:', 'discord:', 'hf:', ''];
         for (const prefix of prefixes) {
             const key = `${prefix}${fileId}`;
             record = await env.img_url.getWithMetadata(key);
             if (record && record.metadata) {
                 isR2Storage = record.metadata.storage === 'r2' || record.metadata.storageType === 'r2';
+                isS3Storage = record.metadata.storageType === 's3';
+                isDiscordStorage = record.metadata.storageType === 'discord';
+                isHFStorage = record.metadata.storageType === 'huggingface';
                 break;
             }
         }
@@ -159,6 +184,21 @@ export async function onRequest(context) {
     if (isR2Storage && env.R2_BUCKET) {
         const r2Key = record?.metadata?.r2Key || fileId;
         return await handleR2File(context, r2Key, record);
+    }
+
+    // 如果是 S3 存储
+    if (isS3Storage) {
+        return await handleS3File(context, fileId, record);
+    }
+
+    // 如果是 Discord 存储
+    if (isDiscordStorage) {
+        return await handleDiscordFile(context, fileId, record);
+    }
+
+    // 如果是 HuggingFace 存储
+    if (isHFStorage) {
+        return await handleHFFile(context, fileId, record);
     }
     
     // 从 Telegram 获取文件（原有逻辑）
@@ -621,5 +661,217 @@ async function handleR2File(context, r2Key, record = null) {
         const headers = new Headers();
         addCorsHeaders(headers);
         return new Response('Error fetching file from R2: ' + error.message, { status: 500, headers });
+    }
+}
+
+// --- S3 文件处理 ---
+async function handleS3File(context, fileId, record = null) {
+    const { request, env } = context;
+
+    if (request.method === 'OPTIONS') return handleOptions();
+
+    try {
+        // 获取 KV 记录
+        if (!record || !record.metadata) {
+            if (env.img_url) {
+                const prefixes = ['s3:', 'img:', 'vid:', 'aud:', 'doc:', ''];
+                for (const prefix of prefixes) {
+                    record = await env.img_url.getWithMetadata(`${prefix}${fileId}`);
+                    if (record?.metadata) break;
+                }
+            }
+        }
+        if (!record?.metadata) {
+            const headers = new Headers();
+            addCorsHeaders(headers);
+            return new Response('File not found', { status: 404, headers });
+        }
+
+        // 访问控制
+        if (record.metadata.ListType === 'Block' || record.metadata.Label === 'adult') {
+            const url = new URL(request.url);
+            return Response.redirect(`${url.origin}/block-img.html`, 302);
+        }
+
+        const s3Key = record.metadata.s3Key || fileId.replace(/^s3:/, '');
+        const fileName = record.metadata.fileName || fileId;
+        const mimeType = getMimeType(fileName);
+        const rangeHeader = request.headers.get('Range');
+
+        const s3 = createS3Client(env);
+        const s3Response = await s3.getObject(s3Key, rangeHeader ? { range: rangeHeader } : {});
+
+        if (!s3Response) {
+            return new Response('File not found in S3', { status: 404 });
+        }
+
+        const headers = new Headers();
+        addCorsHeaders(headers);
+        headers.set('Content-Type', mimeType);
+        headers.set('Accept-Ranges', 'bytes');
+        headers.set('Cache-Control', 'no-store, max-age=0');
+        headers.set('Content-Disposition', `inline; filename="${encodeURIComponent(fileName)}"; filename*=UTF-8''${encodeURIComponent(fileName)}`);
+
+        // 透传 Content-Length 和 Content-Range
+        const cl = s3Response.headers.get('Content-Length');
+        if (cl) headers.set('Content-Length', cl);
+        const cr = s3Response.headers.get('Content-Range');
+        if (cr) headers.set('Content-Range', cr);
+
+        return new Response(s3Response.body, {
+            status: s3Response.status,
+            headers
+        });
+    } catch (error) {
+        console.error('S3 fetch error:', error);
+        const headers = new Headers();
+        addCorsHeaders(headers);
+        return new Response('Error fetching file from S3: ' + error.message, { status: 500, headers });
+    }
+}
+
+// --- Discord 文件处理 ---
+async function handleDiscordFile(context, fileId, record = null) {
+    const { request, env } = context;
+
+    if (request.method === 'OPTIONS') return handleOptions();
+
+    try {
+        // 获取 KV 记录
+        if (!record || !record.metadata) {
+            if (env.img_url) {
+                const prefixes = ['discord:', 'img:', 'vid:', 'aud:', 'doc:', ''];
+                for (const prefix of prefixes) {
+                    record = await env.img_url.getWithMetadata(`${prefix}${fileId}`);
+                    if (record?.metadata) break;
+                }
+            }
+        }
+        if (!record?.metadata) {
+            const headers = new Headers();
+            addCorsHeaders(headers);
+            return new Response('File not found', { status: 404, headers });
+        }
+
+        // 访问控制
+        if (record.metadata.ListType === 'Block' || record.metadata.Label === 'adult') {
+            const url = new URL(request.url);
+            return Response.redirect(`${url.origin}/block-img.html`, 302);
+        }
+
+        const { discordChannelId, discordMessageId } = record.metadata;
+        if (!discordChannelId || !discordMessageId) {
+            return new Response('Discord metadata incomplete', { status: 500 });
+        }
+
+        // 从 Discord API 获取最新的文件 URL
+        const fileInfo = await getDiscordFileUrl(discordChannelId, discordMessageId, env);
+        if (!fileInfo) {
+            return new Response('File not found on Discord', { status: 404 });
+        }
+
+        // 代理文件内容（Discord CDN URL 会过期，不能直接重定向）
+        const fileName = record.metadata.fileName || fileInfo.filename;
+        const mimeType = getMimeType(fileName);
+
+        const fetchHeaders = {};
+        const rangeHeader = request.headers.get('Range');
+        if (rangeHeader) fetchHeaders['Range'] = rangeHeader;
+
+        const discordResponse = await fetch(fileInfo.url, { headers: fetchHeaders });
+
+        if (!discordResponse.ok && discordResponse.status !== 206) {
+            return new Response('Error fetching file from Discord', { status: 502 });
+        }
+
+        const headers = new Headers();
+        addCorsHeaders(headers);
+        headers.set('Content-Type', mimeType);
+        headers.set('Accept-Ranges', 'bytes');
+        headers.set('Cache-Control', 'no-store, max-age=0');
+        headers.set('Content-Disposition', `inline; filename="${encodeURIComponent(fileName)}"; filename*=UTF-8''${encodeURIComponent(fileName)}`);
+
+        const cl = discordResponse.headers.get('Content-Length');
+        if (cl) headers.set('Content-Length', cl);
+        const cr = discordResponse.headers.get('Content-Range');
+        if (cr) headers.set('Content-Range', cr);
+
+        return new Response(discordResponse.body, {
+            status: discordResponse.status,
+            headers
+        });
+    } catch (error) {
+        console.error('Discord fetch error:', error);
+        const headers = new Headers();
+        addCorsHeaders(headers);
+        return new Response('Error fetching file from Discord: ' + error.message, { status: 500, headers });
+    }
+}
+
+// --- HuggingFace 文件处理 ---
+async function handleHFFile(context, fileId, record = null) {
+    const { request, env } = context;
+
+    if (request.method === 'OPTIONS') return handleOptions();
+
+    try {
+        // 获取 KV 记录
+        if (!record || !record.metadata) {
+            if (env.img_url) {
+                const prefixes = ['hf:', 'img:', 'vid:', 'aud:', 'doc:', ''];
+                for (const prefix of prefixes) {
+                    record = await env.img_url.getWithMetadata(`${prefix}${fileId}`);
+                    if (record?.metadata) break;
+                }
+            }
+        }
+        if (!record?.metadata) {
+            const headers = new Headers();
+            addCorsHeaders(headers);
+            return new Response('File not found', { status: 404, headers });
+        }
+
+        // 访问控制
+        if (record.metadata.ListType === 'Block' || record.metadata.Label === 'adult') {
+            const url = new URL(request.url);
+            return Response.redirect(`${url.origin}/block-img.html`, 302);
+        }
+
+        const hfPath = record.metadata.hfPath;
+        if (!hfPath) {
+            return new Response('HuggingFace path not found in metadata', { status: 500 });
+        }
+
+        const fileName = record.metadata.fileName || fileId;
+        const mimeType = getMimeType(fileName);
+        const rangeHeader = request.headers.get('Range');
+
+        const hfResponse = await getHuggingFaceFile(hfPath, env, rangeHeader ? { range: rangeHeader } : {});
+
+        if (!hfResponse.ok && hfResponse.status !== 206) {
+            return new Response('File not found on HuggingFace', { status: 404 });
+        }
+
+        const headers = new Headers();
+        addCorsHeaders(headers);
+        headers.set('Content-Type', mimeType);
+        headers.set('Accept-Ranges', 'bytes');
+        headers.set('Cache-Control', 'no-store, max-age=0');
+        headers.set('Content-Disposition', `inline; filename="${encodeURIComponent(fileName)}"; filename*=UTF-8''${encodeURIComponent(fileName)}`);
+
+        const cl = hfResponse.headers.get('Content-Length');
+        if (cl) headers.set('Content-Length', cl);
+        const cr = hfResponse.headers.get('Content-Range');
+        if (cr) headers.set('Content-Range', cr);
+
+        return new Response(hfResponse.body, {
+            status: hfResponse.status,
+            headers
+        });
+    } catch (error) {
+        console.error('HuggingFace fetch error:', error);
+        const headers = new Headers();
+        addCorsHeaders(headers);
+        return new Response('Error fetching file from HuggingFace: ' + error.message, { status: 500, headers });
     }
 }

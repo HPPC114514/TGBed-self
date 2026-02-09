@@ -3,6 +3,9 @@
  * POST /api/chunked-upload/complete
  */
 import { checkAuthentication, isAuthRequired } from '../../utils/auth.js';
+import { createS3Client } from '../../utils/s3client.js';
+import { uploadToDiscord } from '../../utils/discord.js';
+import { uploadToHuggingFace } from '../../utils/huggingface.js';
 
 export async function onRequestPost(context) {
   const { request, env } = context;
@@ -72,27 +75,76 @@ export async function onRequestPost(context) {
     const fileExtension = taskData.fileName.split('.').pop().toLowerCase();
 
     let fileKey = null;
-    let storageType = taskData.storageMode === 'r2' ? 'r2' : 'telegram';
+    let storageType = taskData.storageMode || 'telegram';
+    let extraMetadata = {};
 
-    // 优先根据 storageMode 上传到 R2
+    // 根据存储模式上传
     if (storageType === 'r2') {
       if (!env.R2_BUCKET) {
-        return new Response(JSON.stringify({ error: 'R2 未配置，无法完成上传' }), { 
-          status: 500, 
-          headers: { 'Content-Type': 'application/json' } 
+        return new Response(JSON.stringify({ error: 'R2 未配置，无法完成上传' }), {
+          status: 500, headers: { 'Content-Type': 'application/json' }
         });
       }
       const uploadResult = await uploadToR2(file, fileExtension, env);
       fileKey = uploadResult.fileKey;
-      storageType = 'r2';
+    } else if (storageType === 's3') {
+      if (!env.S3_ENDPOINT || !env.S3_ACCESS_KEY_ID) {
+        return new Response(JSON.stringify({ error: 'S3 未配置，无法完成上传' }), {
+          status: 500, headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      const s3 = createS3Client(env);
+      const s3Id = `s3_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+      const s3Key = `${s3Id}.${fileExtension}`;
+      const arrayBuffer = await file.arrayBuffer();
+      await s3.putObject(s3Key, arrayBuffer, {
+        contentType: file.type || 'application/octet-stream',
+        metadata: { 'x-amz-meta-filename': taskData.fileName }
+      });
+      fileKey = `s3:${s3Key}`;
+      extraMetadata.s3Key = s3Key;
+    } else if (storageType === 'discord') {
+      if (!env.DISCORD_WEBHOOK_URL && !env.DISCORD_BOT_TOKEN) {
+        return new Response(JSON.stringify({ error: 'Discord 未配置，无法完成上传' }), {
+          status: 500, headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      const arrayBuffer = await file.arrayBuffer();
+      const discordResult = await uploadToDiscord(arrayBuffer, taskData.fileName, taskData.fileType, env);
+      if (!discordResult.success) {
+        return new Response(JSON.stringify({ error: 'Discord 上传失败: ' + discordResult.error }), {
+          status: 500, headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      const discordId = `discord_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+      fileKey = `discord:${discordId}.${fileExtension}`;
+      extraMetadata.discordChannelId = discordResult.channelId;
+      extraMetadata.discordMessageId = discordResult.messageId;
+      extraMetadata.discordAttachmentId = discordResult.attachmentId;
+    } else if (storageType === 'huggingface') {
+      if (!env.HF_TOKEN || !env.HF_REPO) {
+        return new Response(JSON.stringify({ error: 'HuggingFace 未配置，无法完成上传' }), {
+          status: 500, headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      const arrayBuffer = await file.arrayBuffer();
+      const hfId = `hf_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+      const hfPath = `uploads/${hfId}.${fileExtension}`;
+      const hfResult = await uploadToHuggingFace(arrayBuffer, hfPath, taskData.fileName, env);
+      if (!hfResult.success) {
+        return new Response(JSON.stringify({ error: 'HuggingFace 上传失败: ' + hfResult.error }), {
+          status: 500, headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      fileKey = `hf:${hfId}.${fileExtension}`;
+      extraMetadata.hfPath = hfPath;
     } else {
-      // 上传到 Telegram
+      // 默认上传到 Telegram
+      storageType = 'telegram';
       const result = await uploadToTelegram(file, env);
-
       if (!result.success) {
-        return new Response(JSON.stringify({ error: result.error }), { 
-          status: 500, 
-          headers: { 'Content-Type': 'application/json' } 
+        return new Response(JSON.stringify({ error: result.error }), {
+          status: 500, headers: { 'Content-Type': 'application/json' }
         });
       }
       fileKey = `${result.fileId}.${fileExtension}`;
@@ -112,7 +164,8 @@ export async function onRequestPost(context) {
         totalChunks: taskData.totalChunks,
         storageType,
         r2Key: storageType === 'r2' ? fileKey.replace(/^r2:/, '') : undefined,
-        telegramMessageId: storageType === 'telegram' ? taskData.telegramMessageId : undefined
+        telegramMessageId: storageType === 'telegram' ? taskData.telegramMessageId : undefined,
+        ...extraMetadata
       }
     });
 

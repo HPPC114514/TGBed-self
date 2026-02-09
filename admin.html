@@ -848,8 +848,16 @@
       formattedFileDetails(item) {
         const metadata = item.metadata;
         const timestamp = new Date(metadata.TimeStamp).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
-        const storageType = item.name.startsWith('r2:') ? 'R2 存储' : 'Telegram';
-        const storageColor = item.name.startsWith('r2:') ? '#409eff' : '#67c23a';
+        const storageType = item.name.startsWith('r2:') ? 'R2 存储'
+          : item.name.startsWith('s3:') ? 'S3 存储'
+          : item.name.startsWith('discord:') ? 'Discord'
+          : item.name.startsWith('hf:') ? 'HuggingFace'
+          : 'Telegram';
+        const storageColor = item.name.startsWith('r2:') ? '#409eff'
+          : item.name.startsWith('s3:') ? '#e6a23c'
+          : item.name.startsWith('discord:') ? '#7289da'
+          : item.name.startsWith('hf:') ? '#ff9d00'
+          : '#67c23a';
         const fileSize = metadata.fileSize ? this.formatFileSize(metadata.fileSize) : '未知';
         return `
           <div style="text-align: left; padding: 5px;">

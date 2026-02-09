@@ -1260,6 +1260,27 @@
       }
     }
 
+    /* 访客模式提示条 */
+    .guest-notice {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      padding: 12px 24px;
+      background: linear-gradient(135deg, rgba(230, 162, 60, 0.15) 0%, rgba(255, 215, 228, 0.25) 100%);
+      border: 1.5px solid rgba(230, 162, 60, 0.4);
+      border-radius: var(--border-radius);
+      margin-bottom: 20px;
+      font-size: 0.9em;
+      color: #b88230;
+      font-weight: 500;
+    }
+
+    .guest-notice i {
+      font-size: 1.1em;
+      color: var(--warning-color);
+    }
+
     /* 用户偏好减少动画 */
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after {
@@ -1280,12 +1301,18 @@
       </div>
       <div class="nav-links">
         <a href="./"><i class="fas fa-home"></i> 首页</a>
-        <a href="./gallery.html"><i class="fas fa-images"></i> 图片浏览</a>
-        <a href="./admin.html"><i class="fas fa-cog"></i> 管理后台</a>
+        <a href="./gallery.html" v-if="!isGuest"><i class="fas fa-images"></i> 图片浏览</a>
+        <a href="./admin.html" v-if="!isGuest"><i class="fas fa-cog"></i> 管理后台</a>
         <a href="javascript:void(0)" @click="handleLogout" v-if="isAuthenticated" class="logout-link">
           <i class="fas fa-sign-out-alt"></i> 退出
         </a>
       </div>
+    </div>
+
+    <!-- 访客模式提示条 -->
+    <div class="guest-notice" v-if="isGuest && guestUploadConfig">
+      <i class="fas fa-user-clock"></i>
+      <span>访客模式 - 单文件最大 {{ formatSize(guestUploadConfig.maxFileSize) }}，每日上限 {{ guestUploadConfig.maxDailyUploads }} 次</span>
     </div>
 
     <!-- 主内容区 -->
@@ -1297,7 +1324,8 @@
             <i class="fas fa-upload"></i>
             <span>上传文件</span>
           </div>
-          <span style="color: #999; font-size: 0.85em;">支持批量上传，最大 100MB/个（分片上传）</span>
+          <span v-if="isGuest && guestUploadConfig" style="color: #b88230; font-size: 0.85em;">访客模式 - 单文件最大 {{ formatSize(guestUploadConfig.maxFileSize) }}</span>
+          <span v-else style="color: #999; font-size: 0.85em;">支持批量上传，最大 100MB/个（分片上传）</span>
         </div>
 
         <!-- 上传区域 -->
@@ -1309,7 +1337,8 @@
              :class="{ dragover: isDragging }">
           <i class="fas fa-cloud-upload-alt upload-icon"></i>
           <div class="upload-text">点击或拖拽文件到此区域上传</div>
-          <div class="upload-hint">支持图片、视频、音频、文档等多种格式，单文件最大 100MB</div>
+          <div class="upload-hint" v-if="isGuest && guestUploadConfig">访客模式：单文件最大 {{ formatSize(guestUploadConfig.maxFileSize) }}，不支持分片上传</div>
+          <div class="upload-hint" v-else>支持图片、视频、音频、文档等多种格式，单文件最大 100MB</div>
           <input type="file" class="upload-input" ref="fileInput" multiple @change="handleFileSelect">
         </div>
 
@@ -1324,6 +1353,18 @@
             <button class="storage-btn" :class="{ active: storageMode === 'r2', disabled: !r2Available }" @click="setStorageMode('r2')" :disabled="!r2Available">
               <i class="fas fa-cloud"></i>
               <span>R2 存储</span>
+            </button>
+            <button class="storage-btn" v-show="s3Available && !isGuest" :class="{ active: storageMode === 's3', disabled: !s3Available }" @click="setStorageMode('s3')" :disabled="!s3Available">
+              <i class="fas fa-database"></i>
+              <span>S3 API</span>
+            </button>
+            <button class="storage-btn" v-show="discordAvailable && !isGuest" :class="{ active: storageMode === 'discord', disabled: !discordAvailable }" @click="setStorageMode('discord')" :disabled="!discordAvailable">
+              <i class="fab fa-discord"></i>
+              <span>Discord</span>
+            </button>
+            <button class="storage-btn" v-show="huggingfaceAvailable && !isGuest" :class="{ active: storageMode === 'huggingface', disabled: !huggingfaceAvailable }" @click="setStorageMode('huggingface')" :disabled="!huggingfaceAvailable">
+              <i class="fas fa-robot"></i>
+              <span>HuggingFace</span>
             </button>
           </div>
         </div>
@@ -1605,9 +1646,14 @@
         previewData: null,  // 新的预览数据对象
         toasts: [],
         isAuthenticated: false,
-        storageMode: 'telegram', // 存储模式：telegram 或 r2
+        storageMode: 'telegram', // 存储模式：telegram, r2, s3, discord, huggingface
         storageTarget: 'Telegram 频道', // 显示文本
         r2Available: false, // R2 是否可用
+        s3Available: false, // S3 是否可用
+        discordAvailable: false, // Discord 是否可用
+        huggingfaceAvailable: false, // HuggingFace 是否可用
+        isGuest: false, // 是否为访客模式
+        guestUploadConfig: null, // 访客上传配置 { maxFileSize, maxDailyUploads }
         uploadConfig: {
           maxSize: 100 * 1024 * 1024, // 100MB max (chunked upload)
           chunkSize: 5 * 1024 * 1024, // 5MB chunks
@@ -1723,8 +1769,14 @@
           const valid = [];
           const invalid = [];
 
+          // 访客模式使用受限的文件大小上限
+          const maxSize = (this.isGuest && this.guestUploadConfig)
+            ? this.guestUploadConfig.maxFileSize
+            : this.uploadConfig.maxSize;
+          const maxSizeLabel = this.formatSize(maxSize);
+
           files.forEach(file => {
-            if (file.size > this.uploadConfig.maxSize) {
+            if (file.size > maxSize) {
               invalid.push(file.name);
             } else {
               valid.push(file);
@@ -1732,7 +1784,7 @@
           });
 
           if (invalid.length > 0) {
-            this.showToast(`${invalid.length}个文件超过100MB限制`, 'error');
+            this.showToast(`${invalid.length}个文件超过${maxSizeLabel}限制`, 'error');
           }
 
           if (valid.length === 0) return;
@@ -1746,7 +1798,8 @@
               status: 'waiting',
               preview: null,
               progress: 0,
-              isChunked: file.size > this.uploadConfig.smallFileThreshold
+              // 访客模式禁止分片上传
+              isChunked: this.isGuest ? false : (file.size > this.uploadConfig.smallFileThreshold)
             };
 
             // 生成预览
@@ -1757,18 +1810,29 @@
             this.uploadingFiles.push(uploadItem);
           }
 
-          // 开始并发上传
+          // 开始上传
           await this.startUpload();
         },
 
         // 开始上传
         async startUpload() {
           const waiting = this.uploadingFiles.filter(f => f.status === 'waiting');
-          const concurrent = this.uploadConfig.maxConcurrent;
 
-          for (let i = 0; i < waiting.length; i += concurrent) {
-            const batch = waiting.slice(i, i + concurrent);
-            await Promise.all(batch.map(item => this.uploadFile(item)));
+          // Telegram 模式串行上传，每个文件之间 500ms 延迟，避免频率限制
+          if (this.storageMode === 'telegram') {
+            for (let i = 0; i < waiting.length; i++) {
+              await this.uploadFile(waiting[i]);
+              if (i < waiting.length - 1) {
+                await new Promise(resolve => setTimeout(resolve, 500));
+              }
+            }
+          } else {
+            // 其他存储模式使用并发上传
+            const concurrent = this.uploadConfig.maxConcurrent;
+            for (let i = 0; i < waiting.length; i += concurrent) {
+              const batch = waiting.slice(i, i + concurrent);
+              await Promise.all(batch.map(item => this.uploadFile(item)));
+            }
           }
 
           // 上传完成
@@ -1997,23 +2061,32 @@
         async retryAllFailed() {
           const failed = this.uploadingFiles.filter(f => f.status === 'error');
           if (failed.length === 0) return;
-          
+
           this.showToast(`正在重试 ${failed.length} 个失败项...`, 'info');
-          
+
           // 重置状态
           failed.forEach(item => {
             item.status = 'waiting';
             item.error = null;
             item.progress = 0;
           });
-          
-          // 开始并发上传
-          const concurrent = this.uploadConfig.maxConcurrent;
-          for (let i = 0; i < failed.length; i += concurrent) {
-            const batch = failed.slice(i, i + concurrent);
-            await Promise.all(batch.map(item => this.uploadFile(item)));
+
+          // Telegram 模式串行重试，其他模式并发重试
+          if (this.storageMode === 'telegram') {
+            for (let i = 0; i < failed.length; i++) {
+              await this.uploadFile(failed[i]);
+              if (i < failed.length - 1) {
+                await new Promise(resolve => setTimeout(resolve, 500));
+              }
+            }
+          } else {
+            const concurrent = this.uploadConfig.maxConcurrent;
+            for (let i = 0; i < failed.length; i += concurrent) {
+              const batch = failed.slice(i, i + concurrent);
+              await Promise.all(batch.map(item => this.uploadFile(item)));
+            }
           }
-          
+
           const successCount = failed.filter(f => f.status === 'success').length;
           if (successCount > 0) {
             this.showToast(`重试成功 ${successCount}/${failed.length} 个文件`, 'success');
@@ -2502,13 +2575,26 @@
           try {
             const response = await fetch('/api/auth/check', { credentials: 'include' });
             const data = await response.json();
-            
-            // 如果需要认证但未认证，跳转到登录页面
+
+            // 如果需要认证但未认证
             if (data.authRequired && !data.authenticated) {
+              // 检查是否允许访客上传
+              if (data.guestUpload && data.guestUpload.enabled) {
+                this.isGuest = true;
+                this.guestUploadConfig = {
+                  maxFileSize: data.guestUpload.maxFileSize || (5 * 1024 * 1024), // 默认 5MB
+                  maxDailyUploads: data.guestUpload.dailyLimit || 10 // 默认 10 次
+                };
+                // 访客强制使用 telegram 模式
+                this.storageMode = 'telegram';
+                this.storageTarget = 'Telegram 频道';
+                return;
+              }
+              // 没有访客上传权限，跳转登录
               window.location.href = '/login.html?redirect=' + encodeURIComponent(window.location.pathname);
               return;
             }
-            
+
             this.isAuthenticated = data.authRequired && data.authenticated;
           } catch (e) {
             console.error('Auth check failed:', e);
@@ -2520,34 +2606,86 @@
           try {
             const response = await fetch('/api/status', { credentials: 'include' });
             const status = await response.json();
-            // 检查 R2 是否可用
-            this.r2Available = status.r2?.connected && status.r2?.enabled;
-            // 默认使用 Telegram，如果用户之前选择了 R2 且 R2 可用则使用 R2
+
+            // 检查各存储后端是否可用
+            this.r2Available = !!(status.r2?.connected && status.r2?.enabled);
+            this.s3Available = !!(status.s3?.connected && status.s3?.enabled);
+            this.discordAvailable = !!(status.discord?.connected && status.discord?.enabled);
+            this.huggingfaceAvailable = !!(status.huggingface?.connected && status.huggingface?.enabled);
+
+            // 恢复用户上次保存的存储模式
             const savedMode = localStorage.getItem('storageMode');
-            if (savedMode === 'r2' && this.r2Available) {
-              this.storageMode = 'r2';
-              this.storageTarget = 'R2 存储桶';
+            const modeAvailability = {
+              'r2': this.r2Available,
+              's3': this.s3Available,
+              'discord': this.discordAvailable,
+              'huggingface': this.huggingfaceAvailable
+            };
+            const modeLabels = {
+              'telegram': 'Telegram 频道',
+              'r2': 'R2 存储桶',
+              's3': 'S3 存储',
+              'discord': 'Discord 频道',
+              'huggingface': 'HuggingFace 仓库'
+            };
+
+            // 如果保存的模式可用（且非访客模式或是 telegram/r2），恢复之
+            if (savedMode && modeLabels[savedMode]) {
+              if (savedMode === 'telegram') {
+                this.storageMode = 'telegram';
+                this.storageTarget = modeLabels['telegram'];
+              } else if (modeAvailability[savedMode] && !this.isGuest) {
+                this.storageMode = savedMode;
+                this.storageTarget = modeLabels[savedMode];
+              } else if (savedMode === 'r2' && this.r2Available) {
+                this.storageMode = 'r2';
+                this.storageTarget = modeLabels['r2'];
+              } else {
+                this.storageMode = 'telegram';
+                this.storageTarget = modeLabels['telegram'];
+              }
             } else {
               this.storageMode = 'telegram';
-              this.storageTarget = 'Telegram 频道';
+              this.storageTarget = modeLabels['telegram'];
             }
           } catch (e) {
             this.storageMode = 'telegram';
             this.storageTarget = 'Telegram 频道';
             this.r2Available = false;
+            this.s3Available = false;
+            this.discordAvailable = false;
+            this.huggingfaceAvailable = false;
           }
         },
 
         // 切换存储模式
         setStorageMode(mode) {
-          if (mode === 'r2' && !this.r2Available) {
-            this.showToast('R2 存储未配置或未启用', 'error');
+          const modeConfig = {
+            'telegram': { label: 'Telegram 频道', available: true },
+            'r2':       { label: 'R2 存储桶',    available: this.r2Available },
+            's3':       { label: 'S3 存储',       available: this.s3Available },
+            'discord':  { label: 'Discord 频道',  available: this.discordAvailable },
+            'huggingface': { label: 'HuggingFace 仓库', available: this.huggingfaceAvailable }
+          };
+
+          const config = modeConfig[mode];
+          if (!config) return;
+
+          // 访客只允许 telegram 和 r2
+          if (this.isGuest && !['telegram', 'r2'].includes(mode)) {
+            this.showToast('访客模式仅支持 Telegram 和 R2 存储', 'error');
             return;
           }
+
+          if (!config.available && mode !== 'telegram') {
+            this.showToast(`${config.label}未配置或未启用`, 'error');
+            return;
+          }
+
           this.storageMode = mode;
-          this.storageTarget = mode === 'r2' ? 'R2 存储桶' : 'Telegram 频道';
+          this.storageTarget = config.label;
           localStorage.setItem('storageMode', mode);
-          this.showToast(`已切换到 ${this.storageTarget}`, 'success');
+          this.showToast(`已切换到 ${config.label}`, 'success');
         }
       },
       mounted() {
